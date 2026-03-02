@@ -34,7 +34,7 @@ public class Main extends JFrame {
         }
     }
 
-    record Slide(int number, Path path, String ocrText) {
+    record Slide(int number, Path path, List<Word> words) {
     }
 
     private final JTextField urlField = new JTextField();
@@ -403,19 +403,21 @@ public class Main extends JFrame {
                         var path = Files.createTempFile("slide_%03d_".formatted(num), ".png");
                         Files.write(path, bytes);
 
-                        // OCR распознавание текста
-                        String ocrText = "";
+                        // OCR: getWords() возвращает слова с координатами bounding box
+                        List<Word> words = new ArrayList<>();
                         try {
-                            ocrText = tesseract.doOCR(path.toFile()).trim();
-                            if (!ocrText.isEmpty())
-                                log("Слайд %d: распознано %d символов".formatted(num, ocrText.length()));
+                            var ocrImg = ImageIO.read(path.toFile());
+                            words = tesseract.getWords(ocrImg,
+                                    ITessAPI.TessPageIteratorLevel.RIL_WORD);
+                            if (!words.isEmpty())
+                                log("Слайд %d: распознано %d слов".formatted(num, words.size()));
                         } catch (Exception ocrEx) {
                             log("Слайд %d: OCR ошибка - %s".formatted(num,
                                     ocrEx.getMessage() != null ? ocrEx.getMessage()
                                             : ocrEx.getClass().getSimpleName()));
                         }
 
-                        slides.add(new Slide(num, path, ocrText));
+                        slides.add(new Slide(num, path, words));
                     }
 
                     prev = bytes;
@@ -464,27 +466,32 @@ public class Main extends JFrame {
                         doc.addPage(pg);
 
                         try (var cs = new PDPageContentStream(doc, pg)) {
-                            // 1. Сначала добавляем невидимый текст внизу страницы
-                            if (!slide.ocrText().isEmpty()) {
+                            // 1. Невидимый текстовый слой с точными координатами каждого слова
+                            if (!slide.words().isEmpty()) {
                                 cs.beginText();
-                                cs.setFont(font, 12);
-                                cs.setRenderingMode(org.apache.pdfbox.pdmodel.graphics.state.RenderingMode.NEITHER);
-                                cs.newLineAtOffset(0, 0);
-                                // Разбиваем текст на строки, пишем каждую
-                                for (var line : slide.ocrText().split("[\r\n]+")) {
-                                    if (!line.isBlank()) {
+                                cs.setRenderingMode(
+                                        org.apache.pdfbox.pdmodel.graphics.state.RenderingMode.NEITHER);
+                                for (var word : slide.words()) {
+                                    var bb = word.getBoundingBox();
+                                    // Tesseract: origin top-left; PDF: origin bottom-left — инвертируем Y
+                                    float pdfX = bb.x;
+                                    float pdfY = h - bb.y - bb.height;
+                                    float fontSize = Math.max(1f, bb.height * 0.85f);
+                                    cs.setFont(font, fontSize);
+                                    cs.setTextMatrix(
+                                            org.apache.pdfbox.util.Matrix.getTranslateInstance(pdfX, pdfY));
+                                    var text = word.getText() == null ? "" : word.getText().strip();
+                                    if (!text.isEmpty()) {
                                         try {
-                                            cs.showText(line);
+                                            cs.showText(text);
                                         } catch (Exception ignored) {
-                                            // Пропускаем символы вне кодировки шрифта
                                         }
-                                        cs.newLineAtOffset(0, -14);
                                     }
                                 }
                                 cs.endText();
                             }
 
-                            // 2. Поверх текста рисуем изображение — текст становится невидимым
+                            // 2. Изображение поверх — закрывает невидимый текст
                             var pdImg = PDImageXObject.createFromFile(slide.path().toString(), doc);
                             cs.drawImage(pdImg, 0, 0, w, h);
                         }
