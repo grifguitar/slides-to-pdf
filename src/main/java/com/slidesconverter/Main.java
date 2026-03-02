@@ -17,6 +17,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.regex.*;
+import net.sourceforge.tess4j.*;
 
 public class Main extends JFrame {
 
@@ -33,7 +34,7 @@ public class Main extends JFrame {
         }
     }
 
-    record Slide(int number, Path path) {
+    record Slide(int number, Path path, String ocrText) {
     }
 
     private final JTextField urlField = new JTextField();
@@ -48,7 +49,7 @@ public class Main extends JFrame {
     private volatile boolean converting = false;
 
     public Main() {
-        super("GoogleSlides2PDF by kgrigoriy for Anna💕 v1.0");
+        super("GoogleSlides2PDF by kgrigoriy for Anna💕 v1.1");
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
         setSize(680, 440);
         setLocationRelativeTo(null);
@@ -311,9 +312,13 @@ public class Main extends JFrame {
                     page.evaluate("document.body.focus()");
                     log("Фокус установлен");
 
+                    // Инициализируем OCR один раз — загружаем tessdata если нужно
+                    var tessdataDir = ensureTessdata();
+                    var tesseract = buildTesseract(tessdataDir);
+
                     List<Slide> slides = new ArrayList<>();
                     try {
-                        slides = captureSlides(page);
+                        slides = captureSlides(page, tesseract);
                     } finally {
                         // context и browser закрываются всегда — даже при исключении
                         try {
@@ -365,7 +370,7 @@ public class Main extends JFrame {
                 }
             }
 
-            private List<Slide> captureSlides(Page page) throws Exception {
+            private List<Slide> captureSlides(Page page, Tesseract tesseract) throws Exception {
                 List<Slide> slides = new ArrayList<>();
                 byte[] prev = null;
                 int sameCount = 0;
@@ -397,7 +402,20 @@ public class Main extends JFrame {
                         sameCount = 0;
                         var path = Files.createTempFile("slide_%03d_".formatted(num), ".png");
                         Files.write(path, bytes);
-                        slides.add(new Slide(num, path));
+
+                        // OCR распознавание текста
+                        String ocrText = "";
+                        try {
+                            ocrText = tesseract.doOCR(path.toFile()).trim();
+                            if (!ocrText.isEmpty())
+                                log("Слайд %d: распознано %d символов".formatted(num, ocrText.length()));
+                        } catch (Exception ocrEx) {
+                            log("Слайд %d: OCR ошибка - %s".formatted(num,
+                                    ocrEx.getMessage() != null ? ocrEx.getMessage()
+                                            : ocrEx.getClass().getSimpleName()));
+                        }
+
+                        slides.add(new Slide(num, path, ocrText));
                     }
 
                     prev = bytes;
@@ -435,19 +453,120 @@ public class Main extends JFrame {
                     throw new Exception("Сохранение отменено пользователем");
 
                 try (var doc = new PDDocument()) {
+                    // Загружаем Unicode TrueType-шрифт для поддержки кириллицы
+                    // Ищем системный шрифт: Windows → Arial, Linux → DejaVu, macOS → Arial
+                    var font = loadUnicodeFont(doc);
+
                     for (var slide : slides) {
                         BufferedImage img = ImageIO.read(slide.path().toFile());
                         float w = img.getWidth(), h = img.getHeight();
                         var pg = new PDPage(new PDRectangle(w, h));
                         doc.addPage(pg);
-                        var pdImg = PDImageXObject.createFromFile(slide.path().toString(), doc);
+
                         try (var cs = new PDPageContentStream(doc, pg)) {
+                            // 1. Сначала добавляем невидимый текст внизу страницы
+                            if (!slide.ocrText().isEmpty()) {
+                                cs.beginText();
+                                cs.setFont(font, 12);
+                                cs.setRenderingMode(org.apache.pdfbox.pdmodel.graphics.state.RenderingMode.NEITHER);
+                                cs.newLineAtOffset(0, 0);
+                                // Разбиваем текст на строки, пишем каждую
+                                for (var line : slide.ocrText().split("[\r\n]+")) {
+                                    if (!line.isBlank()) {
+                                        try {
+                                            cs.showText(line);
+                                        } catch (Exception ignored) {
+                                            // Пропускаем символы вне кодировки шрифта
+                                        }
+                                        cs.newLineAtOffset(0, -14);
+                                    }
+                                }
+                                cs.endText();
+                            }
+
+                            // 2. Поверх текста рисуем изображение — текст становится невидимым
+                            var pdImg = PDImageXObject.createFromFile(slide.path().toString(), doc);
                             cs.drawImage(pdImg, 0, 0, w, h);
                         }
                     }
+
                     doc.save(outFile.get());
+                    log("PDF с текстовым слоем сохранён: " + outFile.get().getAbsolutePath());
+
                     return outFile.get();
                 }
+            }
+
+            // Tessdata кешируется в ~/.slides-converter/tessdata/
+            // При первом запуске скачивается с GitHub tessdata_fast (~4MB каждый файл)
+            private static final String TESSDATA_URL = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/";
+            private static final String[] TESSDATA_LANGS = { "eng", "rus" };
+
+            private Path ensureTessdata() throws Exception {
+                var tessdataDir = Path.of(System.getProperty("user.home"),
+                        ".slides-converter", "tessdata");
+                Files.createDirectories(tessdataDir);
+
+                for (var lang : TESSDATA_LANGS) {
+                    var file = tessdataDir.resolve(lang + ".traineddata");
+                    if (!Files.exists(file)) {
+                        log("Скачиваю языковые данные OCR: " + lang + "...");
+                        stat("Загрузка OCR: " + lang + "...");
+                        var url = new java.net.URI(TESSDATA_URL + lang + ".traineddata").toURL();
+                        try (var in = url.openStream()) {
+                            Files.copy(in, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                        }
+                        log("OCR " + lang + " — загружено (" +
+                                String.format("%.1f MB", Files.size(file) / 1_048_576.0) + ")");
+                    }
+                }
+                return tessdataDir;
+            }
+
+            private Tesseract buildTesseract(Path tessdataDir) {
+                var t = new Tesseract();
+                t.setDatapath(tessdataDir.toString());
+                t.setLanguage("rus+eng");
+                t.setPageSegMode(6); // Единый блок текста — оптимально для слайдов
+                t.setOcrEngineMode(1); // LSTM — более точный движок
+                return t;
+            }
+
+            private org.apache.pdfbox.pdmodel.font.PDFont loadUnicodeFont(PDDocument doc) {
+                // Кандидаты по платформам — шрифты с полной поддержкой Unicode + кириллица
+                var candidates = new java.util.ArrayList<String>();
+
+                var os = System.getProperty("os.name", "").toLowerCase();
+                if (os.contains("win")) {
+                    candidates.add(System.getenv("WINDIR") + "\\Fonts\\arial.ttf");
+                    candidates.add(System.getenv("WINDIR") + "\\Fonts\\times.ttf");
+                } else if (os.contains("mac")) {
+                    candidates.add("/Library/Fonts/Arial.ttf");
+                    candidates.add("/System/Library/Fonts/Arial Unicode.ttf");
+                    candidates.add("/System/Library/Fonts/Supplemental/Arial Unicode.ttf");
+                    candidates.add("/System/Library/Fonts/Helvetica.ttc");
+                } else {
+                    // Linux
+                    candidates.add("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+                    candidates.add("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf");
+                    candidates.add("/usr/share/fonts/truetype/freefont/FreeSans.ttf");
+                }
+
+                for (var path : candidates) {
+                    if (path == null)
+                        continue;
+                    var f = new File(path);
+                    if (f.exists()) {
+                        try (var is = new java.io.FileInputStream(f)) {
+                            return org.apache.pdfbox.pdmodel.font.PDType0Font.load(doc, is, true);
+                        } catch (Exception ignored) {
+                        }
+                    }
+                }
+
+                // Фоллбэк на встроенный Type1 если TTF не найден (без кириллицы, но не упадёт)
+                log("TTF шрифт не найден — кириллица в текстовом слое может не работать");
+                return org.apache.pdfbox.pdmodel.font.PDType1Font.HELVETICA;
             }
 
             private void installChromium() throws Exception {
