@@ -13,6 +13,7 @@ import java.awt.image.BufferedImage;
 import java.io.*;
 import java.nio.file.*;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -509,15 +510,10 @@ public class Main extends JFrame {
                             if (slide.words().isEmpty()) {
                                 writer.write("(текст не распознан)\n");
                             } else {
-                                // Группируем слова по строкам через Y-координату bbox
-                                var sorted = slide.words().stream()
-                                        .filter(w -> w.getText() != null && !w.getText().isBlank())
-                                        .sorted(java.util.Comparator
-                                                .comparingInt((Word w) -> w.getBoundingBox().y)
-                                                .thenComparingInt(w -> w.getBoundingBox().x))
-                                        .toList();
                                 var lines = new ArrayList<ArrayList<Word>>();
-                                for (var word : sorted) {
+                                for (var word : slide.words()) {
+                                    if (word.getText() == null || word.getText().isBlank())
+                                        continue;
                                     var bb = word.getBoundingBox();
                                     boolean added = false;
                                     for (var line : lines) {
@@ -534,6 +530,9 @@ public class Main extends JFrame {
                                         lines.add(newLine);
                                     }
                                 }
+                                // Сортируем строки по Y первого слова
+                                lines.sort(Comparator.comparingInt(
+                                        line -> line.get(0).getBoundingBox().y));
                                 for (var line : lines) {
                                     var sb = new StringBuilder();
                                     for (var w : line)
