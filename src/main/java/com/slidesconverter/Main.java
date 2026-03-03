@@ -17,6 +17,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.regex.*;
+import java.nio.charset.StandardCharsets;
 import net.sourceforge.tess4j.*;
 
 public class Main extends JFrame {
@@ -499,6 +500,51 @@ public class Main extends JFrame {
 
                     doc.save(outFile.get());
                     log("PDF с текстовым слоем сохранён: " + outFile.get().getAbsolutePath());
+
+                    // Дублируем распознанный текст в .txt (UTF-8)
+                    var txtFile = new File(outFile.get().getAbsolutePath() + ".txt");
+                    try (var writer = new java.io.FileWriter(txtFile, StandardCharsets.UTF_8)) {
+                        for (var slide : slides) {
+                            writer.write("=== Слайд " + slide.number() + " ===\n");
+                            if (slide.words().isEmpty()) {
+                                writer.write("(текст не распознан)\n");
+                            } else {
+                                // Группируем слова по строкам через Y-координату bbox
+                                var sorted = slide.words().stream()
+                                        .filter(w -> w.getText() != null && !w.getText().isBlank())
+                                        .sorted(java.util.Comparator
+                                                .comparingInt((Word w) -> w.getBoundingBox().y)
+                                                .thenComparingInt(w -> w.getBoundingBox().x))
+                                        .toList();
+                                var lines = new ArrayList<ArrayList<Word>>();
+                                for (var word : sorted) {
+                                    var bb = word.getBoundingBox();
+                                    boolean added = false;
+                                    for (var line : lines) {
+                                        var ref = line.get(0).getBoundingBox();
+                                        if (Math.abs(bb.y - ref.y) < ref.height * 0.6) {
+                                            line.add(word);
+                                            added = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!added) {
+                                        var newLine = new ArrayList<Word>();
+                                        newLine.add(word);
+                                        lines.add(newLine);
+                                    }
+                                }
+                                for (var line : lines) {
+                                    var sb = new StringBuilder();
+                                    for (var w : line)
+                                        sb.append(w.getText().strip()).append(" ");
+                                    writer.write(sb.toString().strip() + "\n");
+                                }
+                            }
+                            writer.write("\n");
+                        }
+                    }
+                    log("Текст сохранён: " + txtFile.getAbsolutePath());
 
                     return outFile.get();
                 }
