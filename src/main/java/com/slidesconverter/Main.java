@@ -11,6 +11,7 @@ import javax.swing.*;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.*;
+import java.io.ByteArrayInputStream;
 import java.nio.file.*;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -23,16 +24,29 @@ import net.sourceforge.tess4j.*;
 
 public class Main extends JFrame {
 
-    record ConversionState(String presentationId, String previewUrl) {
+    enum DocType {
+        SLIDES, DOCS
+    }
+
+    record ConversionState(String presentationId, String previewUrl, DocType docType) {
         static Optional<ConversionState> parse(String url) {
-            var m = Pattern.compile("/presentation/d/([a-zA-Z0-9_-]+)").matcher(url);
-            if (!m.find())
-                return Optional.empty();
-            var id = m.group(1);
-            // /present открывает слайды на весь экран без серых рамок
-            return Optional.of(new ConversionState(
-                    id,
-                    "https://docs.google.com/presentation/d/%s/present".formatted(id)));
+            var slidesM = Pattern.compile("/presentation/d/([a-zA-Z0-9_-]+)").matcher(url);
+            if (slidesM.find()) {
+                var id = slidesM.group(1);
+                return Optional.of(new ConversionState(
+                        id,
+                        "https://docs.google.com/presentation/d/%s/present".formatted(id),
+                        DocType.SLIDES));
+            }
+            var docsM = Pattern.compile("/document(?:/u/\\d+)?/d/([a-zA-Z0-9_-]+)").matcher(url);
+            if (docsM.find()) {
+                var id = docsM.group(1);
+                return Optional.of(new ConversionState(
+                        id,
+                        "https://docs.google.com/document/d/%s/mobilebasic".formatted(id),
+                        DocType.DOCS));
+            }
+            return Optional.empty();
         }
     }
 
@@ -45,13 +59,12 @@ public class Main extends JFrame {
     private final JLabel lblStatus = new JLabel("Готов к работе");
     private final JTextArea logArea = new JTextArea();
 
-    // Ссылки для корректного завершения при закрытии окна
     private volatile SwingWorker<File, String> currentWorker = null;
     private volatile Browser currentBrowser = null;
     private volatile boolean converting = false;
 
     public Main() {
-        super("GoogleSlides2PDF by kgrigoriy for Anna💕 v1.1");
+        super("GoogleSlides2PDF by kgrigoriy for Anna💕 v1.2");
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
         setSize(680, 440);
         setLocationRelativeTo(null);
@@ -67,7 +80,6 @@ public class Main extends JFrame {
                             "Подтверждение", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
                     if (ans != JOptionPane.YES_OPTION)
                         return;
-                    // Отменяем worker и сразу закрываем браузер
                     if (currentWorker != null)
                         currentWorker.cancel(true);
                 }
@@ -81,7 +93,7 @@ public class Main extends JFrame {
     }
 
     private void buildUi() {
-        var urlLabel = new JLabel("Ссылка на Google Slides:");
+        var urlLabel = new JLabel("Ссылка на Google Slides или Google Docs:");
         urlField.setFont(new Font("Arial", Font.PLAIN, 13));
 
         btnConvert.setFont(new Font("Arial", Font.BOLD, 13));
@@ -131,14 +143,16 @@ public class Main extends JFrame {
     private void onConvertClicked() {
         var raw = urlField.getText().strip();
         if (raw.isBlank()) {
-            JOptionPane.showMessageDialog(this, "Введите ссылку на Google Slides",
+            JOptionPane.showMessageDialog(this, "Введите ссылку на Google Slides или Google Docs",
                     "Ошибка", JOptionPane.ERROR_MESSAGE);
             return;
         }
         var stateOpt = ConversionState.parse(raw);
         if (stateOpt.isEmpty()) {
             JOptionPane.showMessageDialog(this,
-                    "Не удалось извлечь ID из ссылки. Ожидается:\nhttps://docs.google.com/presentation/d/<ID>/...",
+                    "Не удалось извлечь ID из ссылки. Ожидается:\n" +
+                            "• https://docs.google.com/presentation/d/<ID>/...\n" +
+                            "• https://docs.google.com/document/d/<ID>/...",
                     "Ошибка", JOptionPane.ERROR_MESSAGE);
             return;
         }
@@ -149,15 +163,11 @@ public class Main extends JFrame {
         var home = System.getProperty("user.home");
         var candidates = new java.util.ArrayList<File>();
 
-        // Windows
         var localAppData = System.getenv("LOCALAPPDATA");
         if (localAppData != null)
             candidates.add(new File(localAppData, "ms-playwright"));
 
-        // macOS
         candidates.add(new File(home, "Library/Caches/ms-playwright"));
-
-        // Linux
         candidates.add(new File(home, ".cache/ms-playwright"));
 
         for (var playwrightDir : candidates) {
@@ -213,7 +223,6 @@ public class Main extends JFrame {
             protected void done() {
                 converting = false;
                 currentWorker = null;
-                // currentBrowser уже null — закрыт в finally внутри runConversion
                 btnConvert.setEnabled(true);
                 urlField.setEnabled(true);
                 if (isCancelled()) {
@@ -277,52 +286,25 @@ public class Main extends JFrame {
                     log("Chromium запущен");
                     prog(20);
 
-                    // 1920x1080 — Full HD, соответствует 16:9 Google Slides
+                    int vpW = state.docType() == DocType.DOCS ? 1240 : 1920;
+                    int vpH = state.docType() == DocType.DOCS ? 1754 : 1080;
                     var context = browser.newContext(
-                            new Browser.NewContextOptions().setViewportSize(1920, 1080));
+                            new Browser.NewContextOptions().setViewportSize(vpW, vpH));
                     var page = context.newPage();
 
-                    stat("Загрузка презентации...");
-                    log("URL: " + state.previewUrl());
+                    stat("Загрузка документа...");
+                    log("Тип: " + state.docType() + "  URL: " + state.previewUrl());
                     page.navigate(state.previewUrl());
 
-                    // В /present режиме Google Slides рендерит слайды напрямую в DOM
-                    // без iframe — ждём появления контейнера слайда или network idle
-                    try {
-                        page.waitForSelector(
-                                ".punch-viewer-container, .punch-filmstrip, [class*='punch-slide']",
-                                new Page.WaitForSelectorOptions().setTimeout(12000));
-                        log("Контейнер слайдов найден");
-                    } catch (Exception e) {
-                        // Фоллбэк: ждём network idle если DOM-элемент не найден
-                        log("DOM-селектор не сработал, ждём network idle...");
-                        try {
-                            page.waitForLoadState(com.microsoft.playwright.options.LoadState.NETWORKIDLE,
-                                    new Page.WaitForLoadStateOptions().setTimeout(15000));
-                        } catch (Exception e2) {
-                            log("Network idle timeout, продолжаем");
-                        }
-                    }
-                    // Небольшой буфер на JS-рендер после загрузки сети
-                    page.waitForTimeout(600);
-                    prog(25);
-
-                    // Инжектируем CSS — скрываем UI-оверлеи
-                    injectCss(page);
-
-                    // Даём фокус через JS — mouse.click() в /present переключает слайд вперёд
-                    page.evaluate("document.body.focus()");
-                    log("Фокус установлен");
-
-                    // Инициализируем OCR один раз — загружаем tessdata если нужно
                     var tessdataDir = ensureTessdata();
                     var tesseract = buildTesseract(tessdataDir);
 
                     List<Slide> slides = new ArrayList<>();
                     try {
-                        slides = captureSlides(page, tesseract);
+                        slides = state.docType() == DocType.SLIDES
+                                ? captureSlides(page, tesseract)
+                                : captureDocPages(page, tesseract);
                     } finally {
-                        // context и browser закрываются всегда — даже при исключении
                         try {
                             context.close();
                         } catch (Exception ignored) {
@@ -336,15 +318,14 @@ public class Main extends JFrame {
                     }
 
                     if (slides.isEmpty())
-                        throw new Exception("Не удалось захватить ни одного слайда. " +
-                                "Проверьте что презентация открыта для всех по ссылке.");
+                        throw new Exception("Не удалось захватить ни одной страницы. " +
+                                "Проверьте что документ открыт для всех по ссылке.");
 
                     stat("Создание PDF...");
                     prog(85);
                     try {
                         return buildPdf(slides, state.presentationId());
                     } finally {
-                        // Temp-файлы удаляются всегда — даже если buildPdf бросил исключение
                         for (var s : slides) {
                             try {
                                 Files.deleteIfExists(s.path());
@@ -356,7 +337,6 @@ public class Main extends JFrame {
             }
 
             private void injectCss(Page page) {
-                // Скрываем UI-оверлеи Google Slides (/present показывает панели поверх слайда)
                 var css = String.join(" ",
                         "* { cursor: none !important; }",
                         ".punch-filmstrip, .punch-filmstrip-container,",
@@ -377,11 +357,30 @@ public class Main extends JFrame {
                 byte[] prev = null;
                 int sameCount = 0;
 
+                try {
+                    page.waitForSelector(
+                            ".punch-viewer-container, .punch-filmstrip, [class*='punch-slide']",
+                            new Page.WaitForSelectorOptions().setTimeout(12000));
+                    log("Контейнер слайдов найден");
+                } catch (Exception e) {
+                    log("DOM-селектор не сработал, ждём network idle...");
+                    try {
+                        page.waitForLoadState(com.microsoft.playwright.options.LoadState.NETWORKIDLE,
+                                new Page.WaitForLoadStateOptions().setTimeout(15000));
+                    } catch (Exception e2) {
+                        log("Network idle timeout, продолжаем");
+                    }
+                }
+                page.waitForTimeout(600);
+                prog(25);
+
+                injectCss(page);
+                page.evaluate("document.body.focus()");
+                log("Фокус установлен");
+
                 for (int num = 1; num <= 300; num++) {
                     stat("Слайд %d...".formatted(num));
 
-                    // Ждём стабилизации кадра: делаем два скриншота с паузой 150мс
-                    // Если они одинаковые — слайд отрендерен, можно снимать
                     byte[] a, b;
                     int attempts = 0;
                     do {
@@ -391,7 +390,6 @@ public class Main extends JFrame {
                         b = page.screenshot(new Page.ScreenshotOptions().setType(ScreenshotType.PNG));
                         attempts++;
                     } while (!Arrays.equals(a, b) && attempts < 4);
-                    // Финальный скриншот после стабилизации
                     byte[] bytes = b;
 
                     if (prev != null && Arrays.equals(bytes, prev)) {
@@ -405,7 +403,6 @@ public class Main extends JFrame {
                         var path = Files.createTempFile("slide_%03d_".formatted(num), ".png");
                         Files.write(path, bytes);
 
-                        // OCR: getWords() возвращает слова с координатами bounding box
                         List<Word> words = new ArrayList<>();
                         try {
                             var ocrImg = ImageIO.read(path.toFile());
@@ -429,8 +426,98 @@ public class Main extends JFrame {
                 return slides;
             }
 
+            private List<Slide> captureDocPages(Page page, Tesseract tesseract) throws Exception {
+                stat("Ожидание загрузки документа...");
+
+                try {
+                    page.waitForSelector("body",
+                            new Page.WaitForSelectorOptions().setTimeout(15000));
+                    log("mobilebasic: body загружен");
+                } catch (Exception e) {
+                    log("Таймаут ожидания body, продолжаем");
+                }
+                page.waitForTimeout(1000);
+                prog(25);
+
+                var title = (String) page.evaluate("document.title");
+                log("Заголовок документа: " + title);
+                if (title != null && title.toLowerCase().contains("sign in")) {
+                    throw new Exception(
+                            "Google требует авторизацию. Убедитесь что документ открыт\n" +
+                                    "для просмотра всем по ссылке (Файл → Настройки доступа → Все в интернете).");
+                }
+
+                try {
+                    page.addStyleTag(new Page.AddStyleTagOptions().setContent(
+                            ".gb_2d, .gb_3d, .docs-ml-header, " +
+                                    "#docs-title { display: none !important; } " +
+                                    "body { margin: 0 !important; padding: 0 !important; " +
+                                    "background: #fff !important; }"));
+                    log("CSS инжектирован (mobilebasic)");
+                } catch (Exception e) {
+                    log("CSS не применён: " + e.getMessage());
+                }
+                prog(30);
+
+                log("Создание полного скриншота документа...");
+                byte[] fullBytes = page.screenshot(new Page.ScreenshotOptions()
+                        .setType(ScreenshotType.PNG)
+                        .setFullPage(true));
+                prog(50);
+
+                var fullImg = ImageIO.read(new ByteArrayInputStream(fullBytes));
+                int totalH = fullImg.getHeight();
+                int pageW = fullImg.getWidth();
+                int pageH = (int) Math.round(pageW * 297.0 / 210.0); // A4
+                int pageCount = (int) Math.ceil((double) totalH / pageH);
+                log("Размер документа: %dx%d px, страниц A4: %d".formatted(pageW, totalH, pageCount));
+
+                List<Slide> slides = new ArrayList<>();
+                for (int i = 0; i < pageCount; i++) {
+                    int pageNum = i + 1;
+                    stat("Страница %d / %d...".formatted(pageNum, pageCount));
+
+                    int y = i * pageH;
+                    int height = Math.min(pageH, totalH - y);
+
+                    var pageImg = fullImg.getSubimage(0, y, pageW, height);
+
+                    // Дополняем последнюю неполную страницу белым до pageH
+                    BufferedImage outImg;
+                    if (height < pageH) {
+                        outImg = new BufferedImage(pageW, pageH, BufferedImage.TYPE_INT_RGB);
+                        var g = outImg.createGraphics();
+                        g.setColor(Color.WHITE);
+                        g.fillRect(0, 0, pageW, pageH);
+                        g.drawImage(pageImg, 0, 0, null);
+                        g.dispose();
+                    } else {
+                        outImg = pageImg;
+                    }
+
+                    var path = Files.createTempFile("doc_page_%03d_".formatted(pageNum), ".png");
+                    ImageIO.write(outImg, "PNG", path.toFile());
+
+                    List<Word> words = new ArrayList<>();
+                    try {
+                        words = tesseract.getWords(outImg, ITessAPI.TessPageIteratorLevel.RIL_WORD);
+                        if (!words.isEmpty())
+                            log("Страница %d: распознано %d слов".formatted(pageNum, words.size()));
+                    } catch (Exception ocrEx) {
+                        log("Страница %d: OCR ошибка - %s".formatted(pageNum,
+                                ocrEx.getMessage() != null ? ocrEx.getMessage()
+                                        : ocrEx.getClass().getSimpleName()));
+                    }
+
+                    slides.add(new Slide(pageNum, path, words));
+                    prog(50 + (int) ((double) pageNum / pageCount * 30));
+                }
+
+                log("Захват документа завершён, страниц: " + slides.size());
+                return slides;
+            }
+
             private File buildPdf(List<Slide> slides, String id) throws Exception {
-                // Спрашиваем путь сохранения на EDT, ждём ответа
                 var outFile = new java.util.concurrent.atomic.AtomicReference<File>();
                 var latch = new java.util.concurrent.CountDownLatch(1);
 
@@ -443,7 +530,6 @@ public class Main extends JFrame {
                     chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("PDF файлы", "pdf"));
                     if (chooser.showSaveDialog(Main.this) == JFileChooser.APPROVE_OPTION) {
                         var f = chooser.getSelectedFile();
-                        // Добавляем .pdf если не указано
                         if (!f.getName().toLowerCase().endsWith(".pdf"))
                             f = new File(f.getAbsolutePath() + ".pdf");
                         outFile.set(f);
@@ -457,8 +543,6 @@ public class Main extends JFrame {
                     throw new Exception("Сохранение отменено пользователем");
 
                 try (var doc = new PDDocument()) {
-                    // Загружаем Unicode TrueType-шрифт для поддержки кириллицы
-                    // Ищем системный шрифт: Windows → Arial, Linux → DejaVu, macOS → Arial
                     var font = loadUnicodeFont(doc);
 
                     for (var slide : slides) {
@@ -468,14 +552,12 @@ public class Main extends JFrame {
                         doc.addPage(pg);
 
                         try (var cs = new PDPageContentStream(doc, pg)) {
-                            // 1. Невидимый текстовый слой с точными координатами каждого слова
                             if (!slide.words().isEmpty()) {
                                 cs.beginText();
                                 cs.setRenderingMode(
                                         org.apache.pdfbox.pdmodel.graphics.state.RenderingMode.NEITHER);
                                 for (var word : slide.words()) {
                                     var bb = word.getBoundingBox();
-                                    // Tesseract: origin top-left; PDF: origin bottom-left — инвертируем Y
                                     float pdfX = bb.x;
                                     float pdfY = h - bb.y - bb.height;
                                     float fontSize = Math.max(1f, bb.height * 0.85f);
@@ -493,7 +575,6 @@ public class Main extends JFrame {
                                 cs.endText();
                             }
 
-                            // 2. Изображение поверх — закрывает невидимый текст
                             var pdImg = PDImageXObject.createFromFile(slide.path().toString(), doc);
                             cs.drawImage(pdImg, 0, 0, w, h);
                         }
@@ -502,7 +583,6 @@ public class Main extends JFrame {
                     doc.save(outFile.get());
                     log("PDF с текстовым слоем сохранён: " + outFile.get().getAbsolutePath());
 
-                    // Дублируем распознанный текст в .txt (UTF-8)
                     var txtFile = new File(outFile.get().getAbsolutePath() + ".txt");
                     try (var writer = new java.io.FileWriter(txtFile, StandardCharsets.UTF_8)) {
                         for (var slide : slides) {
@@ -530,7 +610,6 @@ public class Main extends JFrame {
                                         lines.add(newLine);
                                     }
                                 }
-                                // Сортируем строки по Y первого слова
                                 lines.sort(Comparator.comparingInt(
                                         line -> line.get(0).getBoundingBox().y));
                                 for (var line : lines) {
@@ -549,8 +628,6 @@ public class Main extends JFrame {
                 }
             }
 
-            // Tessdata кешируется в ~/.slides-converter/tessdata/
-            // При первом запуске скачивается с GitHub tessdata_fast (~4MB каждый файл)
             private static final String TESSDATA_URL = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/";
             private static final String[] TESSDATA_LANGS = { "eng", "rus" };
 
@@ -579,13 +656,12 @@ public class Main extends JFrame {
                 var t = new Tesseract();
                 t.setDatapath(tessdataDir.toString());
                 t.setLanguage("rus+eng");
-                t.setPageSegMode(6); // Единый блок текста — оптимально для слайдов
-                t.setOcrEngineMode(1); // LSTM — более точный движок
+                t.setPageSegMode(6);
+                t.setOcrEngineMode(1);
                 return t;
             }
 
             private org.apache.pdfbox.pdmodel.font.PDFont loadUnicodeFont(PDDocument doc) {
-                // Кандидаты по платформам — шрифты с полной поддержкой Unicode + кириллица
                 var candidates = new java.util.ArrayList<String>();
 
                 var os = System.getProperty("os.name", "").toLowerCase();
@@ -598,7 +674,6 @@ public class Main extends JFrame {
                     candidates.add("/System/Library/Fonts/Supplemental/Arial Unicode.ttf");
                     candidates.add("/System/Library/Fonts/Helvetica.ttc");
                 } else {
-                    // Linux
                     candidates.add("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
                     candidates.add("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf");
                     candidates.add("/usr/share/fonts/truetype/freefont/FreeSans.ttf");
@@ -616,7 +691,6 @@ public class Main extends JFrame {
                     }
                 }
 
-                // Фоллбэк на встроенный Type1 если TTF не найден (без кириллицы, но не упадёт)
                 log("TTF шрифт не найден — кириллица в текстовом слое может не работать");
                 return org.apache.pdfbox.pdmodel.font.PDType1Font.HELVETICA;
             }
